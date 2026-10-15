@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "RF-STGN"
+version = "0.1.0"
+description = "RF-STGN implementation"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24", "scipy>=1.11", "torch>=2.2", "matplotlib>=3.8", "tzdata>=2024.1"]
+
+[project.scripts]
+rf-stgn = "rf_stgn.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rf_stgn*"]
