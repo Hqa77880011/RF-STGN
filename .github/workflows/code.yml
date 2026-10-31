@@ -12,3 +12,7 @@ jobs:
       - run: python -m pip install .
       - run: python -m compileall -q rf_stgn
       - run: python -c "import rf_stgn.cli"
+      - run: python smoke.py
+        env:
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"

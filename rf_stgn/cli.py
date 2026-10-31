@@ -34,7 +34,10 @@ def reduct(x, decision, radius=.2, epsilon=.005):
 def prepare(args):
     raw = np.load(args.source)
     power = np.asarray(raw['power'], dtype=np.float32)
-    times = [dt.datetime.fromisoformat(str(v).replace('Z', '+00:00')).astimezone(ZoneInfo(args.timezone)) for v in raw['time']]
+    times = [dt.datetime.fromisoformat(str(v).replace('Z', '+00:00')) for v in raw['time']]
+    if any(stamp.utcoffset() is None for stamp in times):
+        raise ValueError('time values must include an explicit timezone offset')
+    times = [stamp.astimezone(ZoneInfo(args.timezone)) for stamp in times]
     n = power.shape[1]
     if power.ndim != 2 or not np.isfinite(power).all() or (power < 0).any():
         raise ValueError('power must be finite nonnegative slots,EVSE and resolved from real metering/pilot data')
@@ -90,7 +93,8 @@ def prepare(args):
             correlations = []
             for _ in range(args.bootstrap):
                 sample_power = np.concatenate([blocks[int(i)] for i in rng.integers(len(blocks), size=len(blocks))]) if blocks else past
-                correlations.append(np.nan_to_num(np.corrcoef(sample_power.T)))
+                # With fewer than two historical slots there is no inter-EVSE correlation evidence.
+                correlations.append(np.nan_to_num(np.corrcoef(sample_power.T)) if len(sample_power) >= 2 else np.eye(n))
             cached[day] = np.maximum(np.quantile(correlations, [.05, .95], axis=0), 0).astype(np.float32)
         low.append(cached[day][0])
         high.append(cached[day][1])
@@ -333,8 +337,10 @@ def schedule(args):
                 power = min(s['pmax'], energy / (.92 * .25)) if t + h < s['end'] else 0.
                 continuation[h] += power
                 energy -= .92 * .25 * power
-        arrival = np.maximum(0, f['prediction'][index, :horizon].sum(-1) - continuation)
-        reserve = arrival + args.beta * f['reserve'][:horizon]
+        # Forecast horizon zero is t+1, whereas scheduling horizon zero is the current slot t.
+        future = np.r_[0., f['prediction'][index, :horizon - 1].sum(-1)]
+        arrival = np.maximum(0, future - continuation)
+        reserve = arrival + args.beta * np.r_[0., f['reserve'][:horizon - 1]]
         exogenous = np.repeat(d['base'][t], horizon) + reserve
         exogenous[0] = d['base'][t]
         begin = time.perf_counter()
