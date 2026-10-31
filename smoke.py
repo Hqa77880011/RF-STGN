@@ -1,4 +1,5 @@
 """Small synthetic forecast/scheduling check, not paper performance evidence."""
+import argparse
 import datetime as dt
 import json
 import tempfile
@@ -13,6 +14,10 @@ from rf_stgn import cli as c
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--baselines', action='store_true')
+    parser.add_argument('--upstream', default='data/upstream')
+    args = parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
@@ -46,6 +51,48 @@ def main():
         second, _ = c.load_model(root / 'fit/model.pt')
         first.eval(); second.eval()
         torch.testing.assert_close(first(*features), second(*features), rtol=0, atol=0)
+        if args.baselines:
+            from rf_stgn import baselines as b
+            all_features = np.arange(d['x'].shape[-1])
+            common = c.tensors(d, np.array([0, 1]), all_features)
+            graph = (d['fixed'] + d['arrival'] + d['cluster']) / 3 + np.eye(nodes)
+            graph /= graph.sum(-1, keepdims=True)
+            for architecture in ['gru', 'dcrnn', 'graph_wavenet', 'astgrn_adapted', 'timesnet', 'itransformer']:
+                torch.manual_seed(0)
+                control = b.build(len(all_features), 'full', architecture, graph, nodes, 8, args.upstream)
+                opt = torch.optim.Adam(control.parameters(), lr=.001)
+                before = {name: value.detach().clone() for name, value in control.named_parameters()}
+                forecast = control(*common)
+                objective = forecast.square().mean()
+                objective.backward()
+                assert torch.isfinite(objective)
+                assert any(value.grad is not None and value.grad.abs().sum() > 0 for name, value in control.named_parameters() if 'encoder' in name or 'embedding' in name)
+                if architecture == 'astgrn_adapted':
+                    assert control.embedding.grad.abs().sum() > 0
+                if architecture == 'graph_wavenet':
+                    assert control.encoder.nodevec1.grad.abs().sum() > 0
+                opt.step()
+                assert any(not torch.equal(before[name], value) for name, value in control.named_parameters())
+                c.train(SimpleNamespace(data=str(root / 'site.npz'), output=str(root / architecture), architecture=architecture,
+                                        variant='full', seed=0, epochs=1, batch=3, width=8, upstream=args.upstream))
+                a, state = c.load_model(root / architecture / 'model.pt')
+                other, _ = c.load_model(root / architecture / 'model.pt')
+                a.eval(); other.eval()
+                torch.testing.assert_close(a(*common), other(*common), atol=0, rtol=0)
+                assert len(state['selected']) == 28
+                c.evaluate(SimpleNamespace(data=str(root / 'site.npz'), model=str(root / architecture / 'model.pt'),
+                                           output=str(root / (architecture + '_eval')), split='test', baseline='model', batch=3))
+            c.train(SimpleNamespace(data=str(root / 'site.npz'), output=str(root / 'xgboost'), architecture='xgboost',
+                                    variant='full', seed=0, epochs=1, batch=3, trees=2, tree_depth=2))
+            c.evaluate(SimpleNamespace(data=str(root / 'site.npz'), model=str(root / 'xgboost/model.pt'),
+                                       output=str(root / 'xgboost_eval'), split='test', baseline='model', batch=3))
+            b.grid(SimpleNamespace(data=str(root / 'site.npz'), output=str(root / 'grid'), values=[0., 1.], max_trials=2,
+                                   epochs=1, batch=3, seed=0, width=8, upstream=args.upstream))
+            selection = json.loads((root / 'grid/selection.json').read_text())
+            assert selection['selected']['validation_rmse'] == min(row['validation_rmse'] for row in selection['trials'])
+            chosen = torch.load(root / 'grid/model.pt', weights_only=False)
+            assert chosen['loss_weights'] == selection['selected']['weights']
+            print('PASS: published-source temporal/GNN baselines, adaptive graph gradients, XGBoost and validation-only weight grid')
         d.close()
         for baseline in ['model', 'persistence', 'oracle']:
             c.evaluate(SimpleNamespace(data=str(root / 'site.npz'), model=str(root / 'fit/model.pt'),

@@ -9,10 +9,12 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: python -m pip install .
+      - run: python -m pip install ".[baselines]"
       - run: python -m compileall -q rf_stgn
       - run: python -c "import rf_stgn.cli"
-      - run: python smoke.py
+      - run: python -m rf_stgn.baselines fetch
+      - run: python smoke.py --baselines
         env:
           OMP_NUM_THREADS: "1"
           OPENBLAS_NUM_THREADS: "1"
+          MKL_THREADING_LAYER: "SEQUENTIAL"

@@ -175,8 +175,16 @@ def predict(model, data, rows, selected, batch):
 def train(args):
     torch.manual_seed(args.seed)
     d = np.load(args.data)
-    selected = np.arange(d['x'].shape[-1]) if args.variant == 'no_reduction' else d['selected']
-    model = Forecast(len(selected), args.variant)
+    from .baselines import build
+    architecture = getattr(args, 'architecture', 'rf_stgn')
+    if architecture == 'xgboost':
+        from .baselines import fit_tree
+        return fit_tree(args, d)
+    selected = np.arange(d['x'].shape[-1]) if args.variant == 'no_reduction' or architecture != 'rf_stgn' else d['selected']
+    graph = (d['fixed'] + d['arrival'] + d['cluster']) / 3 + np.eye(d['power'].shape[1])
+    graph = graph / graph.sum(-1, keepdims=True).clip(1e-8)
+    width, upstream = getattr(args, 'width', 32), getattr(args, 'upstream', 'data/upstream')
+    model = build(len(selected), args.variant, architecture, graph, d['power'].shape[1], width, upstream)
     optimizer = torch.optim.Adam(model.parameters(), lr=.001, weight_decay=1e-5)
     origin = d['origins']
     train_rows = np.flatnonzero(d['split'][origin] == 'train')
@@ -193,11 +201,14 @@ def train(args):
             price = np.stack([d['price'][t + 1:t + 13] for t in origin[rows]])
             occupied = np.stack([d['connected'][t + 1:t + 13].mean(1) for t in origin[rows]])
             price_scale = max(float(np.ptp(d['price'][d['split'] == 'train'])), 1e-8)
-            weight = 1 + target.sum(-1) / float(d['capacity']) + (price - d['price'][d['split'] == 'train'].min()) / price_scale + occupied
-            if args.variant == 'uniform_loss':
+            weight = (1 + getattr(args, 'load_weight', 1.) * target.sum(-1) / float(d['capacity'])
+                      + getattr(args, 'price_weight', 1.) * (price - d['price'][d['split'] == 'train'].min()) / price_scale
+                      + getattr(args, 'occupancy_weight', 1.) * occupied)
+            if args.variant == 'uniform_loss' or architecture != 'rf_stgn':
                 weight[:] = 1
             target_tensor = torch.tensor((target - d['target_mean']) / d['target_std'], dtype=torch.float32)
-            prediction = model(*tensors(d, rows, selected, args.variant))
+            features = tensors(d, rows, selected, args.variant)
+            prediction = model(*features, target=target_tensor) if architecture in ['dcrnn', 'astgrn_adapted'] else model(*features)
             error = nn.functional.huber_loss(prediction, target_tensor, reduction='none')
             w = torch.tensor(weight, dtype=torch.float32)
             loss = (error * w[:, :, None]).sum() / (target.shape[-1] * w.sum())
@@ -212,6 +223,8 @@ def train(args):
             best, patience = rmse, 0
             residual = np.abs(truth.sum(-1) - prediction.sum(-1))
             torch.save({'state': model.state_dict(), 'selected': selected, 'variant': args.variant,
+                        'architecture': architecture, 'width': width, 'upstream': upstream, 'graph': graph,
+                        'loss_weights': [getattr(args, key, 1.) for key in ['load_weight', 'price_weight', 'occupancy_weight']],
                         'reserve': np.quantile(residual, .9, axis=0, method='higher')}, out / 'model.pt')
         else:
             patience += 1
@@ -222,7 +235,12 @@ def train(args):
 
 def load_model(path):
     checkpoint = torch.load(path, weights_only=False, map_location='cpu')
-    model = Forecast(len(checkpoint['selected']), checkpoint['variant'])
+    from .baselines import build, TreeForecast
+    if checkpoint.get('architecture') == 'xgboost':
+        return TreeForecast(checkpoint['tree']), checkpoint
+    graph = checkpoint.get('graph', np.eye(1))
+    model = build(len(checkpoint['selected']), checkpoint['variant'], checkpoint.get('architecture', 'rf_stgn'),
+                  graph, len(graph), checkpoint.get('width', 32), checkpoint.get('upstream', 'data/upstream'))
     model.load_state_dict(checkpoint['state'])
     return model, checkpoint
 
@@ -249,7 +267,7 @@ def evaluate(args):
     site = prediction.sum(-1)
     low, high = np.maximum(0, site - checkpoint['reserve']), site + checkpoint['reserve']
     metrics.update(interval_coverage=float(((truth.sum(-1) >= low) & (truth.sum(-1) <= high)).mean()),
-                   interval_width=float((high - low).mean()), parameters=sum(p.numel() for p in model.parameters()),
+                   interval_width=float((high - low).mean()), parameters=sum(p.numel() for p in model.parameters()) if checkpoint.get('architecture') != 'xgboost' else None,
                    retained_features=len(checkpoint['selected']), forecast_ms_per_origin=latency)
     train_threshold = np.quantile(d['power'][d['split'] == 'train'].sum(1), .9)
     target_slots = d['origins'][rows, None] + np.arange(1, 13)
@@ -402,6 +420,14 @@ def main():
     p.add_argument('--data', required=True)
     p.add_argument('--output', required=True)
     p.add_argument('--variant', choices=['full', 'no_reduction', 'fixed_correlation', 'point', 'lower', 'upper', 'mean_fusion', 'uniform_loss'], default='full')
+    p.add_argument('--architecture', choices=['rf_stgn', 'gru', 'dcrnn', 'graph_wavenet', 'astgrn_adapted', 'timesnet', 'itransformer', 'xgboost'], default='rf_stgn')
+    p.add_argument('--width', type=int, default=32)
+    p.add_argument('--trees', type=int, default=200)
+    p.add_argument('--tree-depth', type=int, default=6)
+    p.add_argument('--upstream', default='data/upstream')
+    p.add_argument('--load-weight', type=float, default=1.)
+    p.add_argument('--price-weight', type=float, default=1.)
+    p.add_argument('--occupancy-weight', type=float, default=1.)
     p.add_argument('--epochs', type=int, default=200)
     p.add_argument('--batch', type=int, default=16)
     p.add_argument('--seed', type=int, default=0)

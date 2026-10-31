@@ -14,3 +14,6 @@ rf-stgn = "rf_stgn.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["rf_stgn*"]
+
+[project.optional-dependencies]
+baselines = ["xgboost>=2", "einops>=0.7", "reformer-pytorch>=1.4"]
