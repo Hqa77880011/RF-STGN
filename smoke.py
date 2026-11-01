@@ -1,4 +1,4 @@
-"""Small synthetic forecast/scheduling check, not paper performance evidence."""
+"""Synthetic checks for forecasting and scheduling."""
 import argparse
 import datetime as dt
 import json
